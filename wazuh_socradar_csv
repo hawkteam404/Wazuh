@@ -1,0 +1,99 @@
+# csv files fields:
+# "title";"description";"mitigation";"severity";"alarm_id";"alarm link";"alarm_assets";"alarm_main_type";"alarm_sub_type";"event_name"
+
+import json
+import requests
+import logging.handlers
+import os
+import shutil
+import time
+from logging.handlers import TimedRotatingFileHandler
+
+def namer(log_name):
+    os.makedirs(socradar_alarms_folder, exist_ok=True)
+    return f"{socradar_alarms_folder}/{log_name.split('/')[-1]}.csv"
+
+def rotator(source, dest):
+    shutil.move(source, dest)
+
+def clean_input_for_csv(input_text):
+    if type(input_text) != str:
+        input_text = json.dumps(input_text)
+    return_str = input_text.replace("\r", "").replace("\"", "\"\"").replace("\n", "||").replace("<br/>", " ").replace(";", ",")
+    return f"\"{return_str}\""
+
+def get_csv_ordered_alarm_info(alarm_dict):
+    event_name = f"{alarm_dict.get('alarm_type_details', {}).get('alarm_main_type')}-{alarm_dict.get('alarm_type_details', {}).get('alarm_sub_type')}"
+    csv_ordered_text = f"{clean_input_for_csv(alarm_dict.get('alarm_type_details', {}).get('alarm_generic_title', ''))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('alarm_text', ''))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('alarm_type_details', {}).get('alarm_default_mitigation_plan', ''))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('alarm_risk_level', ''))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('alarm_id', ''))}," \
+                       f"{clean_input_for_csv('https://platform.socradar.com/app/company/41443/alarm-management?tab=approved&alarmId={}'.format(alarm_dict.get('alarm_id', '')))}," \
+                       f"{clean_input_for_csv('||'.join([str(value) for alarm_asset in alarm_dict.get('alarm_related_assets', []) for value in alarm_asset.get('value', []) if value]))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('status'))}," \
+                       f"{clean_input_for_csv(alarm_dict.get('date'))}," \
+                       f"{clean_input_for_csv(event_name)}"
+    return csv_ordered_text
+
+socradar_alarms_folder = os.environ.get('SOCRADAR_ALARMS_INTEGRATION_FOLDER', './Logs-SOCRadar')
+os.makedirs(socradar_alarms_folder, exist_ok=True)
+log_formatter = logging.Formatter('%(message)s')
+log_file_name = f'{socradar_alarms_folder}/socradar_alarms.log'
+log_handler = TimedRotatingFileHandler(log_file_name, when="M", interval=5)
+log_handler.rotator = rotator
+log_handler.namer = namer
+log_handler.setFormatter(log_formatter)
+logger = logging.getLogger(log_file_name)
+for h in logger.handlers:
+    logger.removeHandler(h)
+logger.setLevel(logging.DEBUG)
+logger.addHandler(log_handler)
+logging.basicConfig()
+siem_logger = logging.getLogger('siem_socradar_alarm_integration_logger')
+siem_logger.setLevel(logging.DEBUG)
+
+# try to get latest alarm id from file
+try:
+    with open(f'{socradar_alarms_folder}/latest_alarm_id', 'rt') as latest_alarm_id_log_file:
+        alarm_id_flag = int(latest_alarm_id_log_file.read())
+except:
+    alarm_id_flag = -1
+
+while True:
+    try:
+        socradar_latest_alarms_response = requests.get('https://platform.socradar.com/api/company/41443/incidents/v4?key=64f5de896db44b72934a1eb499d41c40145cd5da644642349e06a28b14ebd7d1')
+        socradar_latest_alarms_response_json = json.loads(socradar_latest_alarms_response.text)
+        if socradar_latest_alarms_response.status_code >= 400:
+            siem_logger.info(socradar_latest_alarms_response_json.get('error'))
+            time.sleep(60)
+            continue
+        if not socradar_latest_alarms_response_json.get('is_success'):
+            siem_logger.info(socradar_latest_alarms_response_json.get('message'))
+            time.sleep(60)
+            continue
+        else:
+            socradar_latest_alarms_response_list = socradar_latest_alarms_response_json.get('data', [])
+        newly_added_alarms_list = [alarm for alarm in socradar_latest_alarms_response_list if alarm.get('alarm_id', 0) > alarm_id_flag]
+        for alarm in newly_added_alarms_list:
+            try:
+                csv_ordered_info = get_csv_ordered_alarm_info(alarm)
+                logger.info(csv_ordered_info)
+                siem_logger.info('Alarm with alarm id: {} has been submitted to your siem Logger.'.format(alarm.get('alarm_id', '')))
+            except:
+                siem_logger.exception('Exception has been taken while saving alarm with alarm id: {}. '
+                                        'This alarm will be skipped.'.format(alarm.get('alarm_id', '')))
+        if socradar_latest_alarms_response_list and len(newly_added_alarms_list) > 0:
+            alarm_id_flag = max([alarm.get('alarm_id', 0) for alarm in socradar_latest_alarms_response_list])
+            siem_logger.info('Latest incident id: {}.'.format(alarm_id_flag))
+            with open(f'{socradar_alarms_folder}/latest_alarm_id','w') as latest_alarm_id_log_file:
+                latest_alarm_id_log_file.write(f"{alarm_id_flag}")
+        time.sleep(60)
+    except KeyboardInterrupt as e:
+        logger.handlers[0].doRollover()
+        siem_logger.info('Keyboard interrupt is taken, stopping siem-SOCRadar alarm integration daemon.')
+        break
+    except:
+        siem_logger.exception('Exception at siem-SOCRadar alarm integration daemon.')
+        siem_logger.info('Sleeping 60 seconds after taking an exception, will be tried again')
+        time.sleep(60)
